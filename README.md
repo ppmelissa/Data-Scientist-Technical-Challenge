@@ -1,5 +1,4 @@
 # Data-Scientist-Technical-Challenge
-Mercado Libre - Data Scientist Technical Challenge
 
 Este proyecto tiene como objetivo principal desarrollar un modelo de clasificación que permita maximizar las ganancias económicas de la empresa a través de la detección eficiente de eventos relevantes (por ejemplo, fraudes).
 
@@ -12,3 +11,26 @@ Detectar la mayor cantidad de eventos relevantes (recall),
 Mantener un equilibrio entre sensibilidad y precisión (F1-score),
 
 Y sobre todo, maximizar la ganancia neta estimada para la empresa.
+
+# Archivos del Repositorio
+
+Readme.md : Introducción del proyecto
+
+Challenger.ipynb : Código fuente utilizado
+
+MercadoLibre Inc. Data Scientist Hiring Test - Fraud Dataset  - Data.csv : Base original
+
+# Modelos Entrenados
+
+1. Regresión Logística (Logistic Regression)
+
+2. SVM (Support Vector Machine)
+
+3. Random Forest
+
+4. XGBoost (Extreme Gradient Boosting)
+
+
+# Modelo Seleccionado
+
+Se guardo el modelo seleccionado en .pkl por si se requiere para hacer diferentes validaciones
