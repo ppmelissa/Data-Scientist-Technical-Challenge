@@ -31,6 +31,6 @@ MercadoLibre Inc. Data Scientist Hiring Test - Fraud Dataset  - Data.csv : Base 
 4. XGBoost (Extreme Gradient Boosting)
 
 
-# Modelo Seleccionado
+# Uso
 
-Se guardo el modelo seleccionado en .pkl por si se requiere para hacer diferentes validaciones
+Abrir el archivo challenger.ipynb y ejecutar completo directamente
