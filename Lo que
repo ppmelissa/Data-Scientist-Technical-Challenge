@@ -1,0 +1,145 @@
+"""
+Script listo para ejecutar el analisis de estabilidad sobre tu base 'dataset' con target 'marca'.
+
+Incluye:
+1. Estabilidad de rendimiento (CV + bootstrap).
+2. Validacion temporal (si tienes columna de fecha).
+3. Estabilidad de variables (coeficientes e importancias).
+4. PSI entre train y produccion (si tienes datos de produccion).
+5. Guardado de resultados y resumen en consola.
+
+Instrucciones:
+1. Ajusta la ruta de carga de datos (CSV, Parquet, etc.).
+2. Define feature_cols (puedes generarla automaticamente si quieres).
+3. (Opcional) Define columna de fecha y fechas de corte.
+4. (Opcional) Carga datos de produccion para PSI.
+5. Ejecuta:
+   python run_estabilidad_mi_dataset.py
+"""
+
+import pandas as pd
+from modelo_estabilidad_rba import run_full_stability_analysis
+
+
+if __name__ == "__main__":
+    # -------------------------------------------------------------------------
+    # 1. CARGA DE DATOS
+    # -------------------------------------------------------------------------
+    # Ajusta la ruta y formato segun tengas tu base 'dataset'.
+    # Ejemplos:
+    # df = pd.read_csv("dataset.csv")
+    # df = pd.read_parquet("dataset.parquet")
+
+    df = pd.read_csv("dataset.csv")  # <--- CAMBIA ESTO por tu archivo real
+
+    # -------------------------------------------------------------------------
+    # 2. DEFINICION DE VARIABLES
+    # -------------------------------------------------------------------------
+    # Opcion A: generar feature_cols automaticamente (todas las numericas menos 'marca')
+    target_col = "marca"
+
+    feature_cols = [
+        c for c in df.select_dtypes(include=["number"]).columns
+        if c != target_col
+    ]
+
+    # Opcion B: si quieres excluir algunas columnas (IDs, fechas, leakage, etc.):
+    # excluir = ["id_cliente", "fecha_logueo", "ip", "device_id"]
+    # feature_cols = [
+    #     c for c in df.select_dtypes(include=["number"]).columns
+    #     if c != target_col and c not in excluir
+    # ]
+
+    print(f"Numero de variables a usar: {len(feature_cols)}")
+    print("Primeras 20 variables:", feature_cols[:20])
+
+    # -------------------------------------------------------------------------
+    # 3. VALIDACION TEMPORAL (OPCIONAL)
+    # -------------------------------------------------------------------------
+    # Si tienes una columna de fecha y quieres hacer validacion temporal:
+    #
+    # date_col = "fecha_logueo"  # nombre de tu columna de fecha
+    # cutoff_val = "2025-06-01"
+    # cutoff_test = "2025-09-01"
+    #
+    # Si NO tienes fecha o no quieres hacer validacion temporal, deja:
+    date_col = None
+    cutoff_val = None
+    cutoff_test = None
+
+    # -------------------------------------------------------------------------
+    # 4. DATOS DE PRODUCCION PARA PSI (OPCIONAL)
+    # -------------------------------------------------------------------------
+    # Si tienes un dataset de produccion reciente para comparar distribuciones:
+    #
+    # df_prod = pd.read_csv("dataset_produccion.csv")
+    # X_prod = df_prod[feature_cols]
+    #
+    # Si NO tienes, deja:
+    X_prod = None
+
+    # -------------------------------------------------------------------------
+    # 5. EJECUCION DEL ANALISIS DE ESTABILIDAD
+    # -------------------------------------------------------------------------
+    results = run_full_stability_analysis(
+        df=df,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        date_col=date_col,
+        cutoff_val=cutoff_val,
+        cutoff_test=cutoff_test,
+        X_prod=X_prod,
+        n_folds=5,
+        n_bootstrap=200,
+        n_iter_coef=200,
+        n_iter_imp=100,
+        random_state=42
+    )
+
+    # -------------------------------------------------------------------------
+    # 6. GUARDADO DE RESULTADOS
+    # -------------------------------------------------------------------------
+    import os
+    from pathlib import Path
+
+    output_dir = Path("output_estabilidad")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Performance stability
+    results["performance_stability"].to_csv(
+        output_dir / "01_performance_stability.csv", index=False
+    )
+
+    # Temporal validation (si existe)
+    if "temporal_validation" in results:
+        results["temporal_validation"].to_csv(
+            output_dir / "02_temporal_validation.csv", index=False
+        )
+
+    # Variable stability (por modelo)
+    var_stab_dir = output_dir / "03_variable_stability"
+    var_stab_dir.mkdir(parents=True, exist_ok=True)
+
+    for model_name, df_stab in results["variable_stability"].items():
+        safe_name = model_name.replace(" ", "_").replace("/", "_")
+        df_stab.to_csv(var_stab_dir / f"{safe_name}.csv", index=False)
+
+    # PSI (si existe)
+    if "psi" in results:
+        results["psi"].to_csv(output_dir / "04_psi_train_vs_prod.csv", index=False)
+
+    print("\n" + "=" * 80)
+    print("RESULTADOS GUARDADOS EN:")
+    print(f"  {output_dir.absolute()}")
+    print("=" * 80)
+    print("\nArchivos generados:")
+    print("  - 01_performance_stability.csv")
+    if "temporal_validation" in results:
+        print("  - 02_temporal_validation.csv")
+    print("  - 03_variable_stability/")
+    for model_name in results["variable_stability"]:
+        safe_name = model_name.replace(" ", "_").replace("/", "_")
+        print(f"      * {safe_name}.csv")
+    if "psi" in results:
+        print("  - 04_psi_train_vs_prod.csv")
+    print("=" * 80)
