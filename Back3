@@ -1,0 +1,315 @@
+"""
+SFS COMPLETO PARA TU DATASET - VERSION SIN ESTANDARIZACION EN LOGISTICA
+
+DataFrame esperado en notebook: dataset
+Target esperado: marca (binario 0/1)
+
+Ejecuta Forward y Backward Selection para:
+- Logistic Regression (SIN StandardScaler)
+- Random Forest
+- XGBoost
+
+Uso desde notebook:
+    %run sfs_completo_dataset_marca_sin_estandarizacion.py
+
+O manualmente:
+    from sfs_completo_dataset_marca_sin_estandarizacion import ejecutar_sfs_completo
+    results = ejecutar_sfs_completo(dataset)
+"""
+
+from pathlib import Path
+from typing import Dict, List, Tuple, Union
+
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+
+from mlxtend.feature_selection import SequentialFeatureSelector as SFS
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold
+
+
+# =============================================================================
+# 1. CONFIGURACION: MODIFICA SOLO ESTA SECCION SI LO NECESITAS
+# =============================================================================
+TARGET_COL = "marca"
+
+COLUMNAS_A_EXCLUIR = [
+    TARGET_COL,
+    # "id_cliente",
+    # "id_transaccion",
+    # "fecha_logueo",
+    # "timestamp",
+    # "variable_con_leakage",
+]
+
+N_FOLDS = 3
+K_FEATURES = (5, 20)
+N_JOBS = 1
+RANDOM_STATE = 42
+OUTPUT_DIR = "output_sfs"
+
+
+# =============================================================================
+# 2. MODELOS: LOGISTICA SIN ESTANDARIZACION
+# =============================================================================
+def crear_modelos() -> Dict[str, dict]:
+    """Crea los tres modelos que se usaran para SFS."""
+
+    # Regresion Logistica directamente sobre las features originales.
+    # No se aplica StandardScaler ni Pipeline.
+    modelo_logit = LogisticRegression(
+        max_iter=1000,
+        solver="liblinear",
+        random_state=RANDOM_STATE
+    )
+
+    modelo_rf = RandomForestClassifier(
+        n_estimators=300,
+        max_depth=None,
+        min_samples_leaf=1,
+        n_jobs=N_JOBS,
+        random_state=RANDOM_STATE
+    )
+
+    modelo_xgb = xgb.XGBClassifier(
+        n_estimators=300,
+        max_depth=5,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        n_jobs=N_JOBS,
+        random_state=RANDOM_STATE,
+        eval_metric="auc"
+    )
+
+    return {
+        "Logistic_Regression": {
+            "estimator": modelo_logit,
+            "scoring": "roc_auc"
+        },
+        "Random_Forest": {
+            "estimator": modelo_rf,
+            "scoring": "roc_auc"
+        },
+        "XGBoost": {
+            "estimator": modelo_xgb,
+            "scoring": "roc_auc"
+        }
+    }
+
+
+# =============================================================================
+# 3. CONVERTIR RESULTADOS DE MLXTEND A TABLA
+# =============================================================================
+def crear_resumen_sfs(sfs: SFS, nombres_features: pd.Index) -> pd.DataFrame:
+    """
+    Convierte sfs.subsets_ a una tabla por cada cantidad k de features.
+
+    subsets_[k] ya significa el mejor subconjunto con exactamente k variables;
+    por eso no se suma ni se resta 1 a k.
+    """
+    filas = []
+
+    for k, info in sfs.subsets_.items():
+        indices = info["feature_idx"]
+        variables = [nombres_features[i] for i in indices]
+
+        filas.append({
+            "k": int(k),
+            "auc_mean": float(info["avg_score"]),
+            "auc_std": float(info.get("std_dev", np.nan)),
+            "features": ", ".join(variables)
+        })
+
+    return pd.DataFrame(filas).sort_values("k").reset_index(drop=True)
+
+
+# =============================================================================
+# 4. FORWARD Y BACKWARD PARA UN MODELO
+# =============================================================================
+def ejecutar_forward_backward(
+    X: pd.DataFrame,
+    y: pd.Series,
+    estimator,
+    scoring: str,
+    cv: StratifiedKFold,
+    k_features: Union[int, Tuple[int, int]],
+    n_jobs: int = 1
+) -> Dict[str, pd.DataFrame]:
+    """Ejecuta ambos sentidos de seleccion secuencial para un estimador."""
+
+    sfs_forward = SFS(
+        estimator=estimator,
+        k_features=k_features,
+        forward=True,
+        floating=False,
+        scoring=scoring,
+        cv=cv,
+        n_jobs=n_jobs,
+        verbose=1
+    )
+    sfs_forward.fit(X.values, y.values)
+
+    sfs_backward = SFS(
+        estimator=estimator,
+        k_features=k_features,
+        forward=False,
+        floating=False,
+        scoring=scoring,
+        cv=cv,
+        n_jobs=n_jobs,
+        verbose=1
+    )
+    sfs_backward.fit(X.values, y.values)
+
+    return {
+        "forward_summary": crear_resumen_sfs(sfs_forward, X.columns),
+        "backward_summary": crear_resumen_sfs(sfs_backward, X.columns)
+    }
+
+
+# =============================================================================
+# 5. EJECUCION COMPLETA SOBRE EL DATAFRAME `dataset`
+# =============================================================================
+def ejecutar_sfs_completo(
+    dataset: pd.DataFrame,
+    target_col: str = TARGET_COL,
+    columnas_a_excluir: List[str] = COLUMNAS_A_EXCLUIR,
+    n_folds: int = N_FOLDS,
+    k_features: Union[int, Tuple[int, int]] = K_FEATURES,
+    output_dir: str = OUTPUT_DIR
+) -> Dict[str, Dict[str, pd.DataFrame]]:
+    """Ejecuta SFS Forward/Backward para los tres modelos y guarda CSVs."""
+    if target_col not in dataset.columns:
+        raise ValueError(f"No existe el target '{target_col}' en dataset.")
+
+    feature_cols = [
+        col for col in dataset.select_dtypes(include=[np.number]).columns
+        if col not in columnas_a_excluir
+    ]
+
+    if len(feature_cols) < 2:
+        raise ValueError("Se requieren por lo menos dos variables numericas.")
+
+    X = dataset[feature_cols].copy().replace([np.inf, -np.inf], np.nan)
+    X = X.fillna(X.median(numeric_only=True)).fillna(0)
+
+    y = dataset[target_col].copy()
+    filas_validas = y.notna()
+    X = X.loc[filas_validas].reset_index(drop=True)
+    y = y.loc[filas_validas].astype(int).reset_index(drop=True)
+
+    if y.nunique() != 2:
+        raise ValueError(
+            f"El target '{target_col}' debe ser binario. Clases: {sorted(y.unique())}"
+        )
+
+    conteo_clases = y.value_counts().sort_index()
+    if conteo_clases.min() < n_folds:
+        raise ValueError(
+            f"La clase minoritaria tiene {conteo_clases.min()} casos; "
+            f"reduce n_folds={n_folds}."
+        )
+
+    # Ajustar el rango si el maximo de K_FEATURES supera las variables disponibles.
+    if isinstance(k_features, tuple):
+        min_k, max_k = k_features
+        max_k = min(max_k, X.shape[1])
+        min_k = min(min_k, max_k)
+        k_features_ajustado = (min_k, max_k)
+    else:
+        k_features_ajustado = min(int(k_features), X.shape[1])
+
+    print("\n" + "=" * 88)
+    print("SFS FORWARD Y BACKWARD")
+    print("=" * 88)
+    print(f"Target: {target_col}")
+    print(f"Clases: {conteo_clases.to_dict()}")
+    print(f"Features candidatas: {len(feature_cols)}")
+    print(f"Rango de k: {k_features_ajustado}")
+    print(f"CV folds: {n_folds}")
+    print("Regresion Logistica: SIN estandarizacion")
+
+    cv = StratifiedKFold(
+        n_splits=n_folds,
+        shuffle=True,
+        random_state=RANDOM_STATE
+    )
+
+    modelos = crear_modelos()
+    carpeta_salida = Path(output_dir)
+    carpeta_salida.mkdir(parents=True, exist_ok=True)
+
+    results = {}
+    resumen_mejores = []
+
+    for nombre_modelo, config in modelos.items():
+        print("\n" + "-" * 88)
+        print(f"MODELO: {nombre_modelo}")
+        print("-" * 88)
+
+        resultado_modelo = ejecutar_forward_backward(
+            X=X,
+            y=y,
+            estimator=config["estimator"],
+            scoring=config["scoring"],
+            cv=cv,
+            k_features=k_features_ajustado,
+            n_jobs=N_JOBS
+        )
+
+        forward_df = resultado_modelo["forward_summary"]
+        backward_df = resultado_modelo["backward_summary"]
+
+        mejor_forward = forward_df.loc[forward_df["auc_mean"].idxmax()]
+        mejor_backward = backward_df.loc[backward_df["auc_mean"].idxmax()]
+
+        forward_df.to_csv(carpeta_salida / f"{nombre_modelo}_forward.csv", index=False)
+        backward_df.to_csv(carpeta_salida / f"{nombre_modelo}_backward.csv", index=False)
+
+        for direccion, mejor in [("forward", mejor_forward), ("backward", mejor_backward)]:
+            resumen_mejores.append({
+                "modelo": nombre_modelo,
+                "direccion": direccion,
+                "k": int(mejor["k"]),
+                "auc_mean": float(mejor["auc_mean"]),
+                "auc_std": float(mejor["auc_std"]),
+                "features": mejor["features"]
+            })
+
+            print(f"\nMejor {direccion.upper()}")
+            print(f"k = {int(mejor['k'])}")
+            print(f"AUC CV = {mejor['auc_mean']:.5f} +/- {mejor['auc_std']:.5f}")
+            print("Variables:")
+            print(mejor["features"])
+
+        results[nombre_modelo] = resultado_modelo
+
+    df_mejores = pd.DataFrame(resumen_mejores).sort_values(
+        ["auc_mean", "auc_std"], ascending=[False, True]
+    ).reset_index(drop=True)
+
+    df_mejores.to_csv(carpeta_salida / "00_resumen_mejores_modelos.csv", index=False)
+
+    print("\n" + "=" * 88)
+    print("SFS FINALIZADO")
+    print(f"Resultados: {carpeta_salida.resolve()}")
+    print("Resumen principal: 00_resumen_mejores_modelos.csv")
+    print("=" * 88)
+
+    return results
+
+
+# =============================================================================
+# 6. EJECUCION AUTOMATICA EN NOTEBOOK
+# =============================================================================
+# Si ejecutas %run sfs_completo_dataset_marca_sin_estandarizacion.py
+# y ya existe un DataFrame llamado dataset, se ejecuta automaticamente.
+if "dataset" in globals():
+    results = ejecutar_sfs_completo(dataset)
+else:
+    print("No se encontro `dataset` en memoria.")
+    print("Carga tu DataFrame y ejecuta:")
+    print("results = ejecutar_sfs_completo(dataset)")
