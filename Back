@@ -1,0 +1,291 @@
+"""
+Script para Sequential Feature Selection (SFS) forward y backward
+sobre tu base 'dataset' con target 'marca'.
+
+Modelos:
+- Regresion Logistica
+- Random Forest
+- XGBoost
+
+Incluye:
+1. SFS forward y backward por modelo.
+2. Subconjunto optimo de variables.
+3. Orden de entrada/salida.
+4. Score (AUC) en cada paso.
+5. Guardado de resultados a CSV.
+
+Requisitos:
+    pip install mlxtend scikit-learn xgboost pandas numpy
+"""
+
+from pathlib import Path
+from typing import List, Dict
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import StratifiedKFold
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+import xgboost as xgb
+
+from mlxtend.feature_selection import SequentialFeatureSelection as SFS
+
+
+# -----------------------------------------------------------------------------
+# 1. CONFIGURACION DE MODELOS
+# -----------------------------------------------------------------------------
+def get_models() -> Dict[str, dict]:
+    """
+    Retorna configuracion de modelos a usar en SFS.
+    """
+    models = {
+        "Logistic Regression": {
+            "estimator": LogisticRegression(
+                max_iter=1000,
+                n_jobs=-1,
+                random_state=42
+            ),
+            "scoring": "roc_auc"
+        },
+        "Random Forest": {
+            "estimator": RandomForestClassifier(
+                n_estimators=500,
+                max_depth=None,
+                n_jobs=-1,
+                random_state=42
+            ),
+            "scoring": "roc_auc"
+        },
+        "XGBoost": {
+            "estimator": xgb.XGBClassifier(
+                n_estimators=500,
+                max_depth=6,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                n_jobs=-1,
+                random_state=42,
+                eval_metric="auc"
+            ),
+            "scoring": "roc_auc"
+        }
+    }
+    return models
+
+
+# -----------------------------------------------------------------------------
+# 2. SFS FORWARD Y BACKWARD
+# -----------------------------------------------------------------------------
+def run_sfs_for_model(
+    X: pd.DataFrame,
+    y: pd.Series,
+    model_name: str,
+    estimator,
+    scoring: str,
+    cv: StratifiedKFold,
+    k_features: str | int = "auto",
+    n_jobs: int = -1,
+    verbose: int = 1
+) -> Dict[str, pd.DataFrame]:
+    """
+    Ejecuta SFS forward y backward para un modelo dado.
+    Retorna diccionario con:
+    - forward_summary
+    - backward_summary
+    """
+    results = {}
+
+    # ----- FORWARD -----
+    sfs_forward = SFS(
+        estimator=estimator,
+        k_features=k_features,
+        forward=True,
+        floating=False,
+        scoring=scoring,
+        cv=cv,
+        n_jobs=n_jobs,
+        verbose=verbose
+    )
+    sfs_forward.fit(X.values, y.values)
+
+    # Construir resumen forward
+    forward_rows = []
+    for k in range(1, len(sfs_forward.k_feature_idx_) + 1):
+        idxs = sfs_forward.k_feature_idx_[:k]
+        score = sfs_forward.k_score_df_.loc[k - 1, "avg_score"]
+        std = sfs_forward.k_score_df_.loc[k - 1, "std_dev"]
+        features = [X.columns[i] for i in idxs]
+        forward_rows.append({
+            "k": k,
+            "auc_mean": score,
+            "auc_std": std,
+            "features": ", ".join(features)
+        })
+
+    results["forward_summary"] = pd.DataFrame(forward_rows)
+
+    # ----- BACKWARD -----
+    sfs_backward = SFS(
+        estimator=estimator,
+        k_features=k_features,
+        forward=False,
+        floating=False,
+        scoring=scoring,
+        cv=cv,
+        n_jobs=n_jobs,
+        verbose=verbose
+    )
+    sfs_backward.fit(X.values, y.values)
+
+    # Construir resumen backward
+    backward_rows = []
+    for k in range(1, len(sfs_backward.k_feature_idx_) + 1):
+        idxs = sfs_backward.k_feature_idx_[:k]
+        score = sfs_backward.k_score_df_.loc[k - 1, "avg_score"]
+        std = sfs_backward.k_score_df_.loc[k - 1, "std_dev"]
+        features = [X.columns[i] for i in idxs]
+        backward_rows.append({
+            "k": k,
+            "auc_mean": score,
+            "auc_std": std,
+            "features": ", ".join(features)
+        })
+
+    results["backward_summary"] = pd.DataFrame(backward_rows)
+
+    return results
+
+
+# -----------------------------------------------------------------------------
+# 3. FUNCION PRINCIPAL
+# -----------------------------------------------------------------------------
+def run_full_sfs_analysis(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    target_col: str,
+    output_dir: str = "output_sfs",
+    n_folds: int = 5,
+    k_features: str | int = "auto",
+    random_state: int = 42
+) -> Dict[str, Dict[str, pd.DataFrame]]:
+    """
+    Ejecuta SFS forward y backward para todos los modelos.
+
+    Retorna:
+    - Diccionario por modelo con forward_summary y backward_summary.
+    """
+    X = df[feature_cols].copy()
+    y = df[target_col].copy()
+
+    cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+    models = get_models()
+
+    all_results = {}
+
+    for model_name, config in models.items():
+        print("=" * 80)
+        print(f"SFS para {model_name}")
+        print("=" * 80)
+
+        results = run_sfs_for_model(
+            X=X,
+            y=y,
+            model_name=model_name,
+            estimator=config["estimator"],
+            scoring=config["scoring"],
+            cv=cv,
+            k_features=k_features,
+            n_jobs=-1,
+            verbose=1
+        )
+
+        all_results[model_name] = results
+
+        print(f"\n{model_name} - FORWARD")
+        print(results["forward_summary"].tail())
+
+        print(f"\n{model_name} - BACKWARD")
+        print(results["backward_summary"].tail())
+
+    # Guardar resultados
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    for model_name, results in all_results.items():
+        safe_name = model_name.replace(" ", "_").replace("/", "_")
+
+        results["forward_summary"].to_csv(
+            output_path / f"{safe_name}_forward.csv", index=False
+        )
+        results["backward_summary"].to_csv(
+            output_path / f"{safe_name}_backward.csv", index=False
+        )
+
+    print("\n" + "=" * 80)
+    print("RESULTADOS SFS GUARDADOS EN:")
+    print(f"  {output_path.absolute()}")
+    print("=" * 80)
+
+    return all_results
+
+
+# -----------------------------------------------------------------------------
+# 4. EJECUCION PRINCIPAL
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    # -------------------------------------------------------------------------
+    # 1. CARGA DE DATOS
+    # -------------------------------------------------------------------------
+    df = pd.read_csv("dataset.csv")  # <--- CAMBIA ESTO por tu archivo real
+
+    # -------------------------------------------------------------------------
+    # 2. DEFINICION DE VARIABLES
+    # -------------------------------------------------------------------------
+    target_col = "marca"
+
+    # Opcion A: usar todas las numericas menos el target
+    feature_cols = [
+        c for c in df.select_dtypes(include=["number"]).columns
+        if c != target_col
+    ]
+
+    # Opcion B: si ya tienes una lista filtrada (ej. desde correlacion), usala:
+    # feature_cols = [...]  # tu lista reducida de variables
+
+    print(f"Numero de variables para SFS: {len(feature_cols)}")
+    print("Primeras 20 variables:", feature_cols[:20])
+
+    # -------------------------------------------------------------------------
+    # 3. EJECUCION DE SFS
+    # -------------------------------------------------------------------------
+    # Nota: SFS es costoso. Si tienes muchas variables (>100), considera:
+    # - Reducir antes con correlacion/VIF.
+    # - Usar k_features como un numero fijo (ej. 30) en lugar de 'auto'.
+
+    results = run_full_sfs_analysis(
+        df=df,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        output_dir="output_sfs",
+        n_folds=5,
+        k_features="auto",  # o un numero fijo, ej. 30
+        random_state=42
+    )
+
+    # -------------------------------------------------------------------------
+    # 4. (OPCIONAL) EXTRAER SUBCONJUNTO OPTIMO POR MODELO
+    # -------------------------------------------------------------------------
+    # Ejemplo: tomar el subconjunto con mejor AUC en forward para Logistic Regression
+
+    lr_forward = results["Logistic Regression"]["forward_summary"]
+    best_row = lr_forward.loc[lr_forward["auc_mean"].idxmax()]
+    best_k = int(best_row["k"])
+    best_features = [f.strip() for f in str(best_row["features"]).split(",")]
+
+    print("\n" + "=" * 80)
+    print("SUBCONJUNTO OPTIMO (LOGISTIC REGRESSION - FORWARD)")
+    print(f"k = {best_k}, AUC = {best_row['auc_mean']:.4f} ± {best_row['auc_std']:.4f}")
+    print("Variables:")
+    for i, f in enumerate(best_features, 1):
+        print(f"  {i}. {f}")
+    print("=" * 80)
