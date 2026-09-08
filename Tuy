@@ -1,0 +1,614 @@
+"""
+Analisis de correlacion y reduccion de variables para modelos RBA / fraude.
+
+Incluye:
+1. Correlacion feature-target (Pearson y Spearman).
+2. Correlacion feature-feature y pares redundantes.
+3. Recomendacion automatica de variable a conservar/eliminar.
+4. Calculo de VIF para multicolinealidad en regresion logistica.
+5. Exportacion de resultados a CSV.
+
+Requisitos:
+    pip install pandas numpy statsmodels
+"""
+
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+
+# -----------------------------------------------------------------------------
+# 1. Correlacion de cada feature contra el target binario Y
+# -----------------------------------------------------------------------------
+def feature_target_correlation(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    target_col: str,
+    method: str = "spearman"
+) -> pd.DataFrame:
+    """
+    Calcula correlacion entre cada feature numerica y el target (0/1).
+
+    Para fraude, Spearman suele ser un buen punto de partida porque es robusto
+    ante outliers y detecta relaciones monotonicas, no solo lineales.
+    """
+    data = df[feature_cols + [target_col]].copy()
+    correlations = data.corr(method=method)[target_col].drop(target_col)
+
+    result = pd.DataFrame({
+        "feature": correlations.index,
+        f"corr_{method}_target": correlations.values,
+        f"abs_corr_{method}_target": correlations.abs().values,
+        "missing_rate": data[feature_cols].isna().mean().reindex(correlations.index).values,
+        "n_unique": data[feature_cols].nunique().reindex(correlations.index).values
+    })
+
+    return result.sort_values(f"abs_corr_{method}_target", ascending=False).reset_index(drop=True)
+
+
+# -----------------------------------------------------------------------------
+# 2. Correlacion entre features y deteccion de pares redundantes
+# -----------------------------------------------------------------------------
+def high_correlation_pairs(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    method: str = "spearman",
+    threshold: float = 0.80
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Retorna:
+    - Matriz de correlacion entre features.
+    - Tabla de pares con |correlacion| >= threshold.
+    """
+    corr_matrix = df[feature_cols].corr(method=method)
+    rows = []
+
+    for i, feature_1 in enumerate(corr_matrix.columns):
+        for j in range(i + 1, len(corr_matrix.columns)):
+            feature_2 = corr_matrix.columns[j]
+            corr_value = corr_matrix.iloc[i, j]
+
+            if pd.notna(corr_value) and abs(corr_value) >= threshold:
+                rows.append({
+                    "feature_1": feature_1,
+                    "feature_2": feature_2,
+                    f"corr_{method}": corr_value,
+                    f"abs_corr_{method}": abs(corr_value)
+                })
+
+    pair_cols = ["feature_1", "feature_2", f"corr_{method}", f"abs_corr_{method}"]
+    pairs = pd.DataFrame(rows, columns=pair_cols)
+
+    if not pairs.empty:
+        pairs = pairs.sort_values(f"abs_corr_{method}", ascending=False).reset_index(drop=True)
+
+    return corr_matrix, pairs
+
+
+# -----------------------------------------------------------------------------
+# 3. Recomendacion de variable a conservar ante pares correlacionados
+# -----------------------------------------------------------------------------
+def recommend_feature_pruning(
+    corr_target: pd.DataFrame,
+    corr_pairs: pd.DataFrame,
+    method_target: str = "spearman"
+) -> pd.DataFrame:
+    """
+    Para cada par muy correlacionado, recomienda conservar la feature con mayor
+    correlacion absoluta con Y. Si empatan, conserva la de menor missing rate.
+
+    Importante: esta es una recomendacion automatica; valida siempre sentido de
+    negocio, leakage, disponibilidad en tiempo real y estabilidad temporal.
+    """
+    target_col_abs = f"abs_corr_{method_target}_target"
+    target_lookup = corr_target.set_index("feature")[[target_col_abs, "missing_rate", "n_unique"]]
+
+    recommendations = []
+
+    for _, row in corr_pairs.iterrows():
+        f1, f2 = row["feature_1"], row["feature_2"]
+        f1_target = target_lookup.loc[f1, target_col_abs]
+        f2_target = target_lookup.loc[f2, target_col_abs]
+        f1_missing = target_lookup.loc[f1, "missing_rate"]
+        f2_missing = target_lookup.loc[f2, "missing_rate"]
+
+        if f1_target > f2_target:
+            keep, drop, reason = f1, f2, "Mayor correlacion absoluta con target"
+        elif f2_target > f1_target:
+            keep, drop, reason = f2, f1, "Mayor correlacion absoluta con target"
+        elif f1_missing < f2_missing:
+            keep, drop, reason = f1, f2, "Empate con target; menor porcentaje de nulos"
+        elif f2_missing < f1_missing:
+            keep, drop, reason = f2, f1, "Empate con target; menor porcentaje de nulos"
+        else:
+            keep, drop, reason = f1, f2, "Empate; decision pendiente de criterio de negocio"
+
+        recommendations.append({
+            "feature_1": f1,
+            "feature_2": f2,
+            "keep_recommended": keep,
+            "drop_candidate": drop,
+            "reason": reason,
+            f"abs_corr_{method_target}_target_feature_1": f1_target,
+            f"abs_corr_{method_target}_target_feature_2": f2_target,
+            "missing_rate_feature_1": f1_missing,
+            "missing_rate_feature_2": f2_missing,
+            "correlation_between_features": row.iloc[-2]
+        })
+
+    return pd.DataFrame(recommendations)
+
+
+# -----------------------------------------------------------------------------
+# 4. VIF: diagnostico adicional de multicolinealidad para regresion logistica
+# -----------------------------------------------------------------------------
+def calculate_vif(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    max_rows: Optional[int] = 100_000
+) -> pd.DataFrame:
+    """
+    Calcula VIF por feature. El VIF requiere variables numericas sin NA.
+
+    Guia orientativa:
+    - VIF < 5: sin alerta relevante.
+    - 5 <= VIF < 10: multicolinealidad moderada; revisar.
+    - VIF >= 10: multicolinealidad alta; intervenir o justificar.
+    """
+    X = df[feature_cols].replace([np.inf, -np.inf], np.nan).dropna().copy()
+
+    if max_rows is not None and len(X) > max_rows:
+        X = X.sample(max_rows, random_state=42)
+
+    # Quitar columnas constantes: el VIF no se puede calcular correctamente.
+    usable_cols = X.columns[X.nunique() > 1].tolist()
+    X = X[usable_cols]
+
+    if X.shape[1] < 2:
+        return pd.DataFrame(columns=["feature", "vif", "vif_status"])
+
+    rows = []
+    values = X.astype(float).values
+
+    for idx, feature in enumerate(X.columns):
+        try:
+            vif = variance_inflation_factor(values, idx)
+        except Exception:
+            vif = np.inf
+
+        if vif < 5:
+            status = "Sin alerta"
+        elif vif < 10:
+            status = "Moderado"
+        else:
+            status = "Alto"
+
+        rows.append({"feature": feature, "vif": vif, "vif_status": status})
+
+    return pd.DataFrame(rows).sort_values("vif", ascending=False).reset_index(drop=True)
+
+
+# -----------------------------------------------------------------------------
+# 5. Funcion principal y exportacion
+# -----------------------------------------------------------------------------
+def run_correlation_analysis(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    target_col: str,
+    correlation_method: str = "spearman",
+    pair_threshold: float = 0.80,
+    run_vif: bool = True,
+    output_dir: Optional[str] = "output_correlacion"
+) -> dict:
+    """
+    Ejecuta el analisis completo y, opcionalmente, guarda resultados a CSV.
+
+    Retorna un diccionario con:
+    - corr_target: ranking X vs Y.
+    - corr_matrix: matriz X vs X.
+    - high_corr_pairs: pares con correlacion alta.
+    - recommendations: sugerencia automatica de poda.
+    - vif: VIF para regresion logistica.
+    """
+    missing_features = sorted(set(feature_cols) - set(df.columns))
+    if missing_features:
+        raise ValueError(f"Features no encontradas en df: {missing_features}")
+    if target_col not in df.columns:
+        raise ValueError(f"Target no encontrado en df: {target_col}")
+
+    if correlation_method not in {"pearson", "spearman"}:
+        raise ValueError("correlation_method debe ser 'pearson' o 'spearman'.")
+
+    # Se excluyen features no numericas; encodea categoricas antes si las necesitas.
+    numeric_features = df[feature_cols].select_dtypes(include=np.number).columns.tolist()
+    excluded_features = sorted(set(feature_cols) - set(numeric_features))
+
+    if not numeric_features:
+        raise ValueError("No hay features numericas para calcular correlaciones.")
+
+    corr_target = feature_target_correlation(
+        df=df,
+        feature_cols=numeric_features,
+        target_col=target_col,
+        method=correlation_method
+    )
+
+    corr_matrix, corr_pairs = high_correlation_pairs(
+        df=df,
+        feature_cols=numeric_features,
+        method=correlation_method,
+        threshold=pair_threshold
+    )
+
+    recommendations = recommend_feature_pruning(
+        corr_target=corr_target,
+        corr_pairs=corr_pairs,
+        method_target=correlation_method
+    )
+
+    vif = calculate_vif(df, numeric_features) if run_vif else pd.DataFrame()
+
+    results = {
+        "corr_target": corr_target,
+        "corr_matrix": corr_matrix,
+        "high_corr_pairs": corr_pairs,
+        "recommendations": recommendations,
+        "vif": vif,
+        "excluded_non_numeric_features": pd.DataFrame({"feature": excluded_features})
+    }
+
+    if output_dir is not None:
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        corr_target.to_csv(output_path / "01_correlacion_feature_target.csv", index=False)
+        corr_matrix.to_csv(output_path / "02_matriz_correlacion_features.csv")
+        corr_pairs.to_csv(output_path / "03_pares_alta_correlacion.csv", index=False)
+        recommendations.to_csv(output_path / "04_recomendaciones_poda.csv", index=False)
+        vif.to_csv(output_path / "05_vif_multicolinealidad.csv", index=False)
+        results["excluded_non_numeric_features"].to_csv
+otro
+
+
+"""
+Pipeline completo de estabilidad para modelos RBA (fraudes)
+Modelos: Regresion Logistica, Random Forest, XGBoost
+
+Incluye:
+1. Estabilidad del rendimiento (CV, bootstrap, validacion temporal)
+2. Estabilidad de variables (bootstrap de coeficientes e importancias)
+3. PSI entre train y produccion
+4. Tablas comparativas
+
+Autor: Asistente de datos
+Fecha: 2026-09-03
+"""
+
+import numpy as np
+import pandas as pd
+import warnings
+from typing import Dict, List, Tuple, Optional
+
+from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
+from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.inspection import permutation_importance
+from sklearn.metrics import roc_auc_score
+from sklearn.utils import resample
+
+import xgboost as xgb
+
+warnings.filterwarnings("ignore")
+
+
+# =============================================================================
+# 1. FUNCIONES AUXILIARES
+# =============================================================================
+
+def compute_psi(expected: np.ndarray, actual: np.ndarray, bins: int = 10) -> float:
+    """
+    Calcula Population Stability Index (PSI) entre dos distribuciones.
+    
+    expected: datos de referencia (ej. train)
+    actual: datos a comparar (ej. produccion)
+    bins: numero de bins para variables continuas
+    """
+    # Crear bins usando la distribucion de referencia
+    breakpoints = np.quantile(expected, np.linspace(0, 1, bins + 1))
+    breakpoints = np.unique(breakpoints)
+    
+    if len(breakpoints) < 2:
+        return 0.0
+    
+    def bin_counts(data: np.ndarray) -> np.ndarray:
+        counts = np.histogram(data, bins=breakpoints)[0]
+        pct = counts / counts.sum()
+        # Evitar ceros
+        pct = np.where(pct == 0, 1e-6, pct)
+        return pct
+    
+    exp_pct = bin_counts(expected)
+    act_pct = bin_counts(actual)
+    
+    psi = np.sum((act_pct - exp_pct) * np.log(act_pct / exp_pct))
+    return psi
+
+
+def bootstrap_auc(
+    X: pd.DataFrame,
+    y: pd.Series,
+    model,
+    n_iter: int = 200,
+    test_size: float = 0.3,
+    scoring: str = "roc_auc",
+    random_state: int = 42
+) -> np.ndarray:
+    """
+    Bootstrap de rendimiento (AUC u otra metrica).
+    """
+    rng = np.random.RandomState(random_state)
+    scores = []
+    
+    for i in range(n_iter):
+        X_boot, y_boot = resample(X, y, random_state=rng.randint(0, 10000))
+        
+        # Hold-out interno (out-of-bag aproximado)
+        mask = ~np.isin(np.arange(len(X)), X_boot.index)
+        if mask.sum() < 20:
+            continue
+        
+        X_oob, y_oob = X.iloc[mask], y.iloc[mask]
+        
+        model.fit(X_boot, y_boot)
+        
+        if scoring == "roc_auc":
+            pred = model.predict_proba(X_oob)[:, 1]
+            score = roc_auc_score(y_oob, pred)
+        else:
+            score = model.score(X_oob, y_oob)
+        
+        scores.append(score)
+    
+    return np.array(scores)
+
+
+def bootstrap_coefficients_logreg(
+    X: pd.DataFrame,
+    y: pd.Series,
+    n_iter: int = 200,
+    random_state: int = 42
+) -> pd.DataFrame:
+    """
+    Bootstrap de coeficientes para regresion logistica.
+    """
+    rng = np.random.RandomState(random_state)
+    coefs = []
+    
+    for i in range(n_iter):
+        X_boot, y_boot = resample(X, y, random_state=rng.randint(0, 10000))
+        
+        logreg = LogisticRegression(
+            max_iter=1000,
+            n_jobs=-1,
+            random_state=rng.randint(0, 10000)
+        )
+        logreg.fit(X_boot, y_boot)
+        coefs.append(logreg.coef_[0])
+    
+    coefs = np.array(coefs)  # (n_iter, n_features)
+    mean_coefs = coefs.mean(axis=0)
+    std_coefs = coefs.std(axis=0)
+    
+    df_coefs = pd.DataFrame({
+        "feature": X.columns,
+        "coef_mean": mean_coefs,
+        "coef_std": std_coefs,
+        "coef_cv": std_coefs / (np.abs(mean_coefs) + 1e-9)
+    })
+    return df_coefs.sort_values("coef_cv")
+
+
+def bootstrap_perm_importance(
+    X: pd.DataFrame,
+    y: pd.Series,
+    model_class,
+    model_params: dict,
+    n_iter: int = 100,
+    scoring: str = "roc_auc",
+    random_state: int = 42
+) -> pd.DataFrame:
+    """
+    Bootstrap de permutation importance para RF, XGBoost, etc.
+    """
+    rng = np.random.RandomState(random_state)
+    importances_list = []
+    
+    for i in range(n_iter):
+        X_boot, y_boot = resample(X, y, random_state=rng.randint(0, 10000))
+        
+        model = model_class(**model_params, random_state=rng.randint(0, 10000))
+        model.fit(X_boot, y_boot)
+        
+        # Hold-out interno para permutation importance
+        mask = ~np.isin(np.arange(len(X)), X_boot.index)
+        if mask.sum() < 50:
+            continue
+        
+        X_oob, y_oob = X.iloc[mask], y.iloc[mask]
+        
+        pi = permutation_importance(
+            model, X_oob, y_oob,
+            n_repeats=20,
+            scoring=scoring,
+            random_state=rng.randint(0, 10000),
+            n_jobs=-1
+        )
+        importances_list.append(pi.importances_mean)
+    
+    importances_arr = np.array(importances_list)  # (n_iter, n_features)
+    mean_imp = importances_arr.mean(axis=0)
+    std_imp = importances_arr.std(axis=0)
+    
+    df_imp = pd.DataFrame({
+        "feature": X.columns,
+        "importance_mean": mean_imp,
+        "importance_std": std_imp,
+        "importance_cv": std_imp / (np.abs(mean_imp) + 1e-9)
+    })
+    return df_imp.sort_values("importance_mean", ascending=False)
+
+
+# =============================================================================
+# 2. CONFIGURACION DE MODELOS
+# =============================================================================
+
+def get_models() -> Dict[str, dict]:
+    """
+    Retorna configuracion de modelos a evaluar.
+    """
+    models = {
+        "Logistic Regression": {
+            "class": LogisticRegression,
+            "params": {
+                "max_iter": 1000,
+                "n_jobs": -1,
+                "random_state": 42
+            },
+            "type": "linear"
+        },
+        "Random Forest": {
+            "class": RandomForestClassifier,
+            "params": {
+                "n_estimators": 500,
+                "max_depth": None,
+                "n_jobs": -1,
+                "random_state": 42
+            },
+            "type": "tree"
+        },
+        "XGBoost": {
+            "class": xgb.XGBClassifier,
+            "params": {
+                "n_estimators": 500,
+                "max_depth": 6,
+                "learning_rate": 0.05,
+                "subsample": 0.8,
+                "colsample_bytree": 0.8,
+                "n_jobs": -1,
+                "random_state": 42,
+                "eval_metric": "auc"
+            },
+            "type": "tree"
+        }
+    }
+    return models
+
+
+# =============================================================================
+# 3. EVALUACION DE ESTABILIDAD DE RENDIMIENTO
+# =============================================================================
+
+def evaluate_performance_stability(
+    X: pd.DataFrame,
+    y: pd.Series,
+    models: Dict[str, dict],
+    n_folds: int = 5,
+    n_bootstrap: int = 200,
+    random_state: int = 42
+) -> pd.DataFrame:
+    """
+    Evalua estabilidad de rendimiento (CV + bootstrap) para todos los modelos.
+    """
+    cv = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+    
+    results = []
+    
+    for name, config in models.items():
+        model_class = config["class"]
+        params = config["params"]
+        
+        model = model_class(**params)
+        
+        # Cross-validation
+        cv_scores = cross_val_score(model, X, y, cv=cv, scoring="roc_auc")
+        
+        # Bootstrap
+        model_boot = model_class(**params)
+        boot_scores = bootstrap_auc(X, y, model_boot, n_iter=n_bootstrap, random_state=random_state)
+        
+        results.append({
+            "modelo": name,
+            "auc_cv_mean": cv_scores.mean(),
+            "auc_cv_std": cv_scores.std(),
+            "auc_bootstrap_mean": boot_scores.mean(),
+            "auc_bootstrap_std": boot_scores.std(),
+            "auc_bootstrap_ci_low": np.percentile(boot_scores, 2.5),
+            "auc_bootstrap_ci_high": np.percentile(boot_scores, 97.5)
+        })
+    
+    df_results = pd.DataFrame(results)
+    return df_results
+
+
+# =============================================================================
+# 4. VALIDACION TEMPORAL
+# =============================================================================
+
+def temporal_validation(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    target_col: str,
+    date_col: str,
+    models: Dict[str, dict],
+    cutoff_val: str,
+    cutoff_test: str
+) -> pd.DataFrame:
+    """
+    Validacion temporal: train (antes de cutoff_val),
+    val (cutoff_val a cutoff_test), test (despues de cutoff_test).
+    """
+    df = df.sort_values(date_col)
+    
+    train = df[df[date_col] < cutoff_val]
+    val = df[(df[date_col] >= cutoff_val) & (df[date_col] < cutoff_test)]
+    test = df[df[date_col] >= cutoff_test]
+    
+    X_train, y_train = train[feature_cols], train[target_col]
+    X_val, y_val = val[feature_cols], val[target_col]
+    X_test, y_test = test[feature_cols], test[target_col]
+    
+    results = []
+    
+    for name, config in models.items():
+        model_class = config["class"]
+        params = config["params"]
+        
+        model = model_class(**params)
+        model.fit(X_train, y_train)
+        
+        auc_train = roc_auc_score(y_train, model.predict_proba(X_train)[:, 1])
+        auc_val = roc_auc_score(y_val, model.predict_proba(X_val)[:, 1])
+        auc_test = roc_auc_score(y_test, model.predict_proba(X_test)[:, 1])
+        
+        results.append({
+            "modelo": name,
+            "auc_train": auc_train,
+            "auc_val": auc_val,
+            "auc_test": auc_test,
+            "drop_train_val": auc_train - auc_val,
+            "drop_val_test": auc_val - auc_test,
+            "drop_train_test": auc_train - auc_test
+        })
+    
+    df_results = pd.DataFrame(results)
+    return df_results
+
+
+# =============================================================================
+# 5. ESTABILIDAD DE VARIABLES
+# =======================================================================
+
+
