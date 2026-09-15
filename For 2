@@ -1,0 +1,325 @@
+# =============================================================================
+# FORWARD SELECTION MANUAL SOBRE MUESTRA ESTRATIFICADA DE HASTA 100.000 FILAS
+# =============================================================================
+# Este codigo esta pensado para copiarlo en celdas de un notebook.
+# No usa import de un archivo .py.
+# No guarda la muestra en Parquet.
+# Target: marca (0/1)
+# DataFrame esperado: dataset
+
+# -----------------------------------------------------------------------------
+# CELDA 1 - IMPORTS
+# -----------------------------------------------------------------------------
+from pathlib import Path
+from typing import Dict, List, Tuple, Union
+
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+
+from mlxtend.feature_selection import SequentialFeatureSelector as SFS
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold, train_test_split
+
+
+# -----------------------------------------------------------------------------
+# CELDA 2 - CONFIGURACION
+# -----------------------------------------------------------------------------
+TARGET_COL = "marca"
+SAMPLE_SIZE = 100_000
+N_FOLDS = 3
+K_FEATURES = (5, 15)
+N_JOBS = 1
+RANDOM_STATE = 42
+OUTPUT_DIR = "output_forward_100k"
+
+# Agrega aqui IDs, fechas o variables con leakage que no deben entrar.
+COLUMNAS_A_EXCLUIR = [
+    TARGET_COL,
+    # "id_cliente",
+    # "id_transaccion",
+    # "fecha_logueo",
+    # "timestamp",
+]
+
+
+# -----------------------------------------------------------------------------
+# CELDA 3 - MUESTRA ESTRATIFICADA
+# -----------------------------------------------------------------------------
+def crear_muestra_estratificada(
+    dataset: pd.DataFrame,
+    target_col: str,
+    sample_size: int,
+    random_state: int = 42
+) -> pd.DataFrame:
+    """Crea una muestra conservando la proporcion de las clases de target."""
+    if target_col not in dataset.columns:
+        raise ValueError(f"No existe el target '{target_col}'.")
+
+    if len(dataset) <= sample_size:
+        return dataset.sample(frac=1, random_state=random_state).reset_index(drop=True)
+
+    muestra, _ = train_test_split(
+        dataset,
+        train_size=sample_size,
+        stratify=dataset[target_col],
+        random_state=random_state
+    )
+
+    return muestra.reset_index(drop=True)
+
+
+# -----------------------------------------------------------------------------
+# CELDA 4 - MODELOS
+# -----------------------------------------------------------------------------
+def crear_modelos() -> Dict[str, dict]:
+    """Define Logistica sin estandarizacion, Random Forest y XGBoost."""
+    return {
+        "Logistic_Regression": {
+            "estimator": LogisticRegression(
+                max_iter=1_000,
+                solver="liblinear",
+                random_state=RANDOM_STATE
+            ),
+            "scoring": "roc_auc"
+        },
+        "Random_Forest": {
+            "estimator": RandomForestClassifier(
+                n_estimators=200,
+                max_depth=None,
+                min_samples_leaf=1,
+                n_jobs=N_JOBS,
+                random_state=RANDOM_STATE
+            ),
+            "scoring": "roc_auc"
+        },
+        "XGBoost": {
+            "estimator": xgb.XGBClassifier(
+                n_estimators=200,
+                max_depth=5,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                n_jobs=N_JOBS,
+                random_state=RANDOM_STATE,
+                eval_metric="auc"
+            ),
+            "scoring": "roc_auc"
+        }
+    }
+
+
+# -----------------------------------------------------------------------------
+# CELDA 5 - RESUMEN DE RESULTADOS SFS
+# -----------------------------------------------------------------------------
+def crear_resumen_forward(
+    sfs: SFS,
+    nombres_features: pd.Index
+) -> pd.DataFrame:
+    """Convierte sfs.subsets_ en una tabla ordenada por k."""
+    filas = []
+
+    for k, info in sfs.subsets_.items():
+        indices = info["feature_idx"]
+        variables = [nombres_features[i] for i in indices]
+
+        filas.append({
+            "k": int(k),
+            "auc_mean": float(info["avg_score"]),
+            "auc_std": float(info.get("std_dev", np.nan)),
+            "features": ", ".join(variables)
+        })
+
+    return (
+        pd.DataFrame(filas)
+        .sort_values("k")
+        .reset_index(drop=True)
+    )
+
+
+# -----------------------------------------------------------------------------
+# CELDA 6 - FORWARD PARA UN MODELO
+# -----------------------------------------------------------------------------
+def ejecutar_forward_modelo(
+    X: pd.DataFrame,
+    y: pd.Series,
+    estimator,
+    scoring: str,
+    cv: StratifiedKFold,
+    k_features: Union[int, Tuple[int, int]],
+    n_jobs: int = 1
+) -> pd.DataFrame:
+    """Ejecuta Forward Selection y devuelve el resumen."""
+    sfs = SFS(
+        estimator=estimator,
+        k_features=k_features,
+        forward=True,
+        floating=False,
+        scoring=scoring,
+        cv=cv,
+        n_jobs=n_jobs,
+        verbose=1
+    )
+
+    sfs.fit(X.values, y.values)
+    return crear_resumen_forward(sfs, X.columns)
+
+
+# -----------------------------------------------------------------------------
+# CELDA 7 - FUNCION PRINCIPAL MANUAL
+# -----------------------------------------------------------------------------
+def ejecutar_forward_100k(
+    dataset: pd.DataFrame,
+    target_col: str = TARGET_COL,
+    columnas_a_excluir: List[str] = COLUMNAS_A_EXCLUIR,
+    sample_size: int = SAMPLE_SIZE,
+    n_folds: int = N_FOLDS,
+    k_features: Union[int, Tuple[int, int]] = K_FEATURES,
+    output_dir: str = OUTPUT_DIR
+) -> Dict[str, pd.DataFrame]:
+    """Ejecuta Forward Selection sobre una muestra estratificada."""
+    if target_col not in dataset.columns:
+        raise ValueError(f"No existe el target '{target_col}' en dataset.")
+
+    # 1. Crear muestra estratificada.
+    muestra = crear_muestra_estratificada(
+        dataset=dataset,
+        target_col=target_col,
+        sample_size=sample_size,
+        random_state=RANDOM_STATE
+    )
+
+    # 2. Tomar columnas numericas excepto las excluidas.
+    feature_cols = [
+        col for col in muestra.select_dtypes(include=[np.number]).columns
+        if col not in columnas_a_excluir
+    ]
+
+    if len(feature_cols) < 2:
+        raise ValueError("Se necesitan al menos dos variables numericas.")
+
+    # 3. Construir X e y.
+    X = muestra[feature_cols].copy()
+    y = muestra[target_col].copy()
+
+    # 4. Limpiar infinitos y nulos.
+    X = X.replace([np.inf, -np.inf], np.nan)
+    X = X.fillna(X.median(numeric_only=True)).fillna(0)
+
+    # 5. Eliminar filas sin target y convertir target a entero.
+    filas_validas = y.notna()
+    X = X.loc[filas_validas].reset_index(drop=True)
+    y = y.loc[filas_validas].astype(int).reset_index(drop=True)
+
+    if y.nunique() != 2:
+        raise ValueError(
+            f"El target debe ser binario. Clases encontradas: {sorted(y.unique())}"
+        )
+
+    conteo_target = y.value_counts().sort_index()
+    if conteo_target.min() < n_folds:
+        raise ValueError(
+            f"La clase minoritaria tiene {conteo_target.min()} filas; "
+            f"reduce n_folds={n_folds}."
+        )
+
+    # 6. Ajustar rango de k al numero de features disponible.
+    if isinstance(k_features, tuple):
+        min_k, max_k = k_features
+        max_k = min(max_k, len(feature_cols))
+        min_k = min(min_k, max_k)
+        k_features_ajustado = (min_k, max_k)
+    else:
+        k_features_ajustado = min(int(k_features), len(feature_cols))
+
+    # 7. Crear CV.
+    cv = StratifiedKFold(
+        n_splits=n_folds,
+        shuffle=True,
+        random_state=RANDOM_STATE
+    )
+
+    print("\n" + "=" * 88)
+    print("FORWARD SELECTION SOBRE MUESTRA ESTRATIFICADA")
+    print("=" * 88)
+    print(f"Registros originales: {len(dataset):,}")
+    print(f"Registros usados: {len(muestra):,}")
+    print(f"Target: {target_col}")
+    print(f"Distribucion target: {conteo_target.to_dict()}")
+    print(f"Features candidatas: {len(feature_cols)}")
+    print(f"Rango de k: {k_features_ajustado}")
+    print(f"Folds: {n_folds}")
+    print("Regresion logistica: sin estandarizacion")
+
+    # 8. Crear carpeta de salida.
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # No se usa to_parquet. Se guarda la muestra en CSV.
+    muestra.to_csv(
+        output_path / "muestra_estratificada_100k.csv",
+        index=False
+    )
+
+    # 9. Ejecutar Forward para los tres modelos.
+    models = crear_modelos()
+    results = {}
+    mejores = []
+
+    for model_name, config in models.items():
+        print("\n" + "-" * 88)
+        print(f"FORWARD: {model_name}")
+        print("-" * 88)
+
+        summary = ejecutar_forward_modelo(
+            X=X,
+            y=y,
+            estimator=config["estimator"],
+            scoring=config["scoring"],
+            cv=cv,
+            k_features=k_features_ajustado,
+            n_jobs=N_JOBS
+        )
+
+        best = summary.loc[summary["auc_mean"].idxmax()]
+
+        print("\nMejor resultado:")
+        print(f"k = {int(best['k'])}")
+        print(f"AUC medio = {best['auc_mean']:.5f}")
+        print(f"AUC std = {best['auc_std']:.5f}")
+        print("Variables:")
+        print(best["features"])
+
+        summary.to_csv(
+            output_path / f"{model_name}_forward.csv",
+            index=False
+        )
+
+        mejores.append({
+            "modelo": model_name,
+            "k": int(best["k"]),
+            "auc_mean": float(best["auc_mean"]),
+            "auc_std": float(best["auc_std"]),
+            "features": best["features"]
+        })
+
+        results[model_name] = summary
+
+    # 10. Guardar resumen final.
+    mejores_df = (
+        pd.DataFrame(mejores)
+        .sort_values(["auc_mean", "auc_std"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+
+    mejores_df.to_csv(
+        output_path / "00_resumen_mejores_forward.csv",
+        index=False
+    )
+
+    print("\n" + "=" * 88)
+    print("FORWARD FINALIZADO")
+    print(f"Resultados guardados en: {output_path.resolve()}")
+    print("Archivo resumen: 00_resumen_mejores_forward.csv")
+    print("=" * 
