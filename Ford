@@ -1,0 +1,333 @@
+"""
+FORWARD SELECTION SOBRE UNA MUESTRA ESTRATIFICADA DE 100.000 REGISTROS
+
+DataFrame esperado: dataset
+Target: marca (binario 0/1)
+Modelos:
+- Regresion Logistica sin estandarizacion
+- Random Forest
+- XGBoost
+
+El script:
+1. Crea una muestra estratificada de hasta 100.000 registros.
+2. Ejecuta solamente Forward Selection.
+3. Evalua subconjuntos de 5 a 15 variables.
+4. Usa AUC y validacion cruzada estratificada de 3 folds.
+5. Guarda resultados en output_forward_100k/.
+
+Uso desde un notebook donde ya existe `dataset`:
+    %run forward_100k_dataset_marca.py
+
+O manualmente:
+    from forward_100k_dataset_marca import ejecutar_forward_100k
+    results = ejecutar_forward_100k(dataset)
+"""
+
+from pathlib import Path
+from typing import Dict, List, Tuple, Union
+
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+
+from mlxtend.feature_selection import SequentialFeatureSelector as SFS
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold, train_test_split
+
+
+# =============================================================================
+# 1. CONFIGURACION
+# =============================================================================
+TARGET_COL = "marca"
+SAMPLE_SIZE = 100_000
+N_FOLDS = 3
+K_FEATURES = (5, 15)
+N_JOBS = 1
+RANDOM_STATE = 42
+OUTPUT_DIR = "output_forward_100k"
+
+# Incluye aquí IDs, fechas o variables con leakage que nunca deben entrar.
+COLUMNAS_A_EXCLUIR = [
+    TARGET_COL,
+    # "id_cliente",
+    # "id_transaccion",
+    # "fecha_logueo",
+    # "timestamp",
+]
+
+
+# =============================================================================
+# 2. CREAR MUESTRA ESTRATIFICADA
+# =============================================================================
+def crear_muestra_estratificada(
+    dataset: pd.DataFrame,
+    target_col: str,
+    sample_size: int,
+    random_state: int = 42
+) -> pd.DataFrame:
+    """
+    Devuelve una muestra de máximo sample_size conservando la proporción del
+    target. No aplica SMOTE ni undersampling artificial de clases.
+    """
+    if len(dataset) <= sample_size:
+        return dataset.sample(frac=1, random_state=random_state).reset_index(drop=True)
+
+    muestra, _ = train_test_split(
+        dataset,
+        train_size=sample_size,
+        stratify=dataset[target_col],
+        random_state=random_state
+    )
+
+    return muestra.reset_index(drop=True)
+
+
+# =============================================================================
+# 3. DEFINIR MODELOS
+# =============================================================================
+def crear_modelos() -> Dict[str, dict]:
+    """Modelos usados solamente en Forward Selection."""
+    return {
+        "Logistic_Regression": {
+            "estimator": LogisticRegression(
+                max_iter=1_000,
+                solver="liblinear",
+                random_state=RANDOM_STATE
+            ),
+            "scoring": "roc_auc"
+        },
+        "Random_Forest": {
+            "estimator": RandomForestClassifier(
+                n_estimators=200,
+                max_depth=None,
+                min_samples_leaf=1,
+                n_jobs=N_JOBS,
+                random_state=RANDOM_STATE
+            ),
+            "scoring": "roc_auc"
+        },
+        "XGBoost": {
+            "estimator": xgb.XGBClassifier(
+                n_estimators=200,
+                max_depth=5,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                n_jobs=N_JOBS,
+                random_state=RANDOM_STATE,
+                eval_metric="auc"
+            ),
+            "scoring": "roc_auc"
+        }
+    }
+
+
+# =============================================================================
+# 4. CONVERTIR SUBSETS_ A TABLA
+# =============================================================================
+def crear_resumen_forward(
+    sfs: SFS,
+    nombres_features: pd.Index
+) -> pd.DataFrame:
+    """Convierte sfs.subsets_ en una tabla ordenada por número de variables."""
+    filas = []
+
+    for k, info in sfs.subsets_.items():
+        indices = info["feature_idx"]
+        variables = [nombres_features[i] for i in indices]
+
+        filas.append({
+            "k": int(k),
+            "auc_mean": float(info["avg_score"]),
+            "auc_std": float(info.get("std_dev", np.nan)),
+            "features": ", ".join(variables)
+        })
+
+    return (
+        pd.DataFrame(filas)
+        .sort_values("k")
+        .reset_index(drop=True)
+    )
+
+
+# =============================================================================
+# 5. FORWARD PARA UN MODELO
+# =============================================================================
+def ejecutar_forward_modelo(
+    X: pd.DataFrame,
+    y: pd.Series,
+    estimator,
+    scoring: str,
+    cv: StratifiedKFold,
+    k_features: Union[int, Tuple[int, int]],
+    n_jobs: int = 1
+) -> pd.DataFrame:
+    """Ejecuta Forward Selection para un estimador."""
+    sfs = SFS(
+        estimator=estimator,
+        k_features=k_features,
+        forward=True,
+        floating=False,
+        scoring=scoring,
+        cv=cv,
+        n_jobs=n_jobs,
+        verbose=1
+    )
+
+    sfs.fit(X.values, y.values)
+    return crear_resumen_forward(sfs, X.columns)
+
+
+# =============================================================================
+# 6. FUNCION PRINCIPAL
+# =============================================================================
+def ejecutar_forward_100k(
+    dataset: pd.DataFrame,
+    target_col: str = TARGET_COL,
+    columnas_a_excluir: List[str] = COLUMNAS_A_EXCLUIR,
+    sample_size: int = SAMPLE_SIZE,
+    n_folds: int = N_FOLDS,
+    k_features: Union[int, Tuple[int, int]] = K_FEATURES,
+    output_dir: str = OUTPUT_DIR
+) -> Dict[str, pd.DataFrame]:
+    """
+    Ejecuta Forward Selection en una muestra estratificada de hasta 100k.
+    """
+    if target_col not in dataset.columns:
+        raise ValueError(f"No existe el target '{target_col}' en dataset.")
+
+    muestra = crear_muestra_estratificada(
+        dataset=dataset,
+        target_col=target_col,
+        sample_size=sample_size,
+        random_state=RANDOM_STATE
+    )
+
+    # Tomar automáticamente columnas numéricas menos exclusiones.
+    feature_cols = [
+        col for col in muestra.select_dtypes(include=[np.number]).columns
+        if col not in columnas_a_excluir
+    ]
+
+    if len(feature_cols) < 2:
+        raise ValueError("Se necesitan al menos dos variables numéricas.")
+
+    X = muestra[feature_cols].copy()
+    y = muestra[target_col].copy()
+
+    # Limpieza básica para evitar fallas durante SFS.
+    X = X.replace([np.inf, -np.inf], np.nan)
+    X = X.fillna(X.median(numeric_only=True)).fillna(0)
+
+    filas_validas = y.notna()
+    X = X.loc[filas_validas].reset_index(drop=True)
+    y = y.loc[filas_validas].astype(int).reset_index(drop=True)
+
+    if y.nunique() != 2:
+        raise ValueError(
+            f"El target debe ser binario. Clases encontradas: {sorted(y.unique())}"
+        )
+
+    conteo = y.value_counts().sort_index()
+    if conteo.min() < n_folds:
+        raise ValueError(
+            f"La clase minoritaria tiene {conteo.min()} casos; reduce n_folds."
+        )
+
+    # Ajustar el máximo de k si hay menos variables disponibles.
+    if isinstance(k_features, tuple):
+        min_k, max_k = k_features
+        max_k = min(max_k, len(feature_cols))
+        min_k = min(min_k, max_k)
+        k_features_ajustado = (min_k, max_k)
+    else:
+        k_features_ajustado = min(int(k_features), len(feature_cols))
+
+    cv = StratifiedKFold(
+        n_splits=n_folds,
+        shuffle=True,
+        random_state=RANDOM_STATE
+    )
+
+    print("\n" + "=" * 88)
+    print("FORWARD SELECTION SOBRE MUESTRA ESTRATIFICADA")
+    print("=" * 88)
+    print(f"Registros originales: {len(dataset):,}")
+    print(f"Registros usados: {len(muestra):,}")
+    print(f"Target: {target_col}")
+    print(f"Distribucion target: {conteo.to_dict()}")
+    print(f"Features candidatas: {len(feature_cols)}")
+    print(f"Rango k: {k_features_ajustado}")
+    print(f"Folds: {n_folds}")
+    print("Estandarizacion en regresion logistica: NO")
+    print("\nFeatures:")
+    print(feature_cols)
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Guardar la muestra para trazabilidad y reproducibilidad.
+    muestra.to_parquet(output_path / "muestra_estratificada_100k.parquet", index=False)
+
+    models = crear_modelos()
+    results = {}
+    mejores = []
+
+    for model_name, config in models.items():
+        print("\n" + "-" * 88)
+        print(f"FORWARD: {model_name}")
+        print("-" * 88)
+
+        summary = ejecutar_forward_modelo(
+            X=X,
+            y=y,
+            estimator=config["estimator"],
+            scoring=config["scoring"],
+            cv=cv,
+            k_features=k_features_ajustado,
+            n_jobs=N_JOBS
+        )
+
+        best = summary.loc[summary["auc_mean"].idxmax()]
+
+        print("\nMejor resultado:")
+        print(f"k = {int(best['k'])}")
+        print(f"AUC medio = {best['auc_mean']:.5f}")
+        print(f"AUC std = {best['auc_std']:.5f}")
+        print("Variables:")
+        print(best["features"])
+
+        summary.to_csv(output_path / f"{model_name}_forward.csv", index=False)
+
+        mejores.append({
+            "modelo": model_name,
+            "k": int(best["k"]),
+            "auc_mean": float(best["auc_mean"]),
+            "auc_std": float(best["auc_std"]),
+            "features": best["features"]
+        })
+
+        results[model_name] = summary
+
+    mejores_df = (
+        pd.DataFrame(mejores)
+        .sort_values(["auc_mean", "auc_std"], ascending=[False, True])
+        .reset_index(drop=True)
+    )
+    mejores_df.to_csv(output_path / "00_resumen_mejores_forward.csv", index=False)
+
+    print("\n" + "=" * 88)
+    print("FORWARD FINALIZADO")
+    print(f"Resultados guardados en: {output_path.resolve()}")
+    print("Archivo resumen: 00_resumen_mejores_forward.csv")
+    print("=" * 88)
+
+    return results
+
+
+# =============================================================================
+# 7. EJECUCION AUTOMATICA CON %run
+# =============================================================================
+if "dataset" in globals():
+    result
